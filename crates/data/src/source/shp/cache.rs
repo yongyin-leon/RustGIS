@@ -79,45 +79,48 @@ fn open_lock(path: &Path) -> io::Result<File> {
     lease_file(path, true)
 }
 
-/// Reject untrusted roots before touching their lock, including writable override parents.
-fn validate_directory(root: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    let metadata = std::fs::symlink_metadata(root)?;
-    #[cfg(not(unix))]
-    let metadata = std::fs::metadata(root)?;
-    if !metadata.file_type().is_dir() {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cache root is not a real directory"));
-    }
+/// Resolve once, validate the actual storage, and never use an unstable alias again.
+fn validate_directory(root: &Path) -> io::Result<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let uid = rustix::process::geteuid().as_raw();
-        if metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+        // Strip trailing slash/dot spellings before lstat: those can otherwise follow
+        // a final symlink even though symlink_metadata normally does not follow it.
+        let absolute: PathBuf = std::path::absolute(root)?.components().collect();
+        let metadata = std::fs::symlink_metadata(&absolute)?;
+        if !metadata.file_type().is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cache root is not private to this user"));
         }
-        // Check both spellings: an ancestor symlink must not hide a writable or
-        // foreign-owned parent. Trusted sticky parents such as /tmp are supported.
-        for path in [std::path::absolute(root)?, root.canonicalize()?] {
-            for parent in path.ancestors().skip(1) {
-                let entry = std::fs::symlink_metadata(parent)?;
-                if entry.uid() != uid && entry.uid() != 0 {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cache ancestor is not owned by a trusted user"));
-                }
-                let metadata = std::fs::metadata(parent)?;
-                if !metadata.is_dir()
-                    || (metadata.uid() != uid && metadata.uid() != 0)
-                    || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
-                {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cache parent is not trusted"));
-                }
+        let resolved = absolute.canonicalize()?;
+        for (depth, parent) in resolved.ancestors().enumerate() {
+            let metadata = std::fs::symlink_metadata(parent)?;
+            let untrusted_owner = metadata.uid() != uid && (depth == 0 || metadata.uid() != 0);
+            let writable = metadata.mode() & 0o022 != 0;
+            if !metadata.file_type().is_dir() || untrusted_owner || (writable && (depth == 0 || metadata.mode() & 0o1000 == 0)) {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cache path is not trusted"));
             }
         }
+        Ok(resolved)
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        // Preserve the platform's existing directory/junction behavior outside Unix.
+        if !std::fs::metadata(root)?.is_dir() {
+            return Err(io::Error::other("cache root is not a directory"));
+        }
+        Ok(root.to_path_buf())
+    }
+}
+
+#[derive(Debug)]
+struct Directory {
+    root: PathBuf,
+    file: File,
 }
 
 /// Shared validation for blocking checkout and nonblocking release paths.
-fn directory_file(root: &Path) -> io::Result<File> {
+fn directory_file(root: &Path) -> io::Result<Directory> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -126,13 +129,14 @@ fn directory_file(root: &Path) -> io::Result<File> {
         builder.mode(0o700);
     }
     builder.create(root)?;
-    validate_directory(root)?;
-    open_lock(&root.join(".rustgis-cache-v1.lock"))
+    let root = validate_directory(root)?;
+    let file = open_lock(&root.join(".rustgis-cache-v1.lock"))?;
+    Ok(Directory { root, file })
 }
-fn directory_lock(root: &Path) -> io::Result<File> {
-    let file = directory_file(root)?;
-    file.lock()?;
-    Ok(file)
+fn directory_lock(root: &Path) -> io::Result<Directory> {
+    let directory = directory_file(root)?;
+    directory.file.lock()?;
+    Ok(directory)
 }
 fn lease_path(path: &Path) -> PathBuf {
     path.with_extension("lease")
@@ -244,14 +248,14 @@ impl Drop for Lease {
         }
         self.lock.take();
         let Ok(directory) = directory_file(root) else { return };
-        if directory.try_lock().is_err() {
+        if directory.file.try_lock().is_err() {
             retry_maintenance(root, self.budget);
             return;
         }
         if self.temporary || !self.ready {
             let _ = remove_unpinned(&self.path);
         }
-        let _ = prune_locked(root, self.budget);
+        let _ = prune_locked(&directory.root, self.budget);
     }
 }
 
@@ -332,8 +336,8 @@ fn create_locked(path: PathBuf, temporary: bool, budget: u64) -> io::Result<(Lea
 
 /// Acquire a ready index before opening SQLite. Only names from this protocol are managed.
 pub fn pin_index(root: &Path, key: &str, budget: u64) -> io::Result<Option<Lease>> {
-    let path = index_path(root, key)?;
-    let _directory = directory_lock(root)?;
+    let directory = directory_lock(root)?;
+    let path = index_path(&directory.root, key)?;
     if !regular(&path) {
         return Ok(None);
     }
@@ -351,8 +355,8 @@ fn index_path(root: &Path, key: &str) -> io::Result<PathBuf> {
     Ok(root.join(format!("rg-index-v1-{key}.sqlite")))
 }
 pub fn reserve_index(root: &Path, key: &str, budget: u64) -> io::Result<Lease> {
-    let path = index_path(root, key)?;
-    let _directory = directory_lock(root)?;
+    let directory = directory_lock(root)?;
+    let path = index_path(&directory.root, key)?;
     // A valid generation pinned by another reader is never replaced. Concurrent
     // builders can use a private temporary index without losing functionality.
     let mut lock = open_lock(&lease_path(&path))?;
@@ -365,7 +369,7 @@ pub fn reserve_index(root: &Path, key: &str, budget: u64) -> io::Result<Lease> {
         return Ok(lease);
     }
     drop(lock);
-    let (lease, file) = create_locked(root.join(format!("rg-index-work-v1-{}.sqlite", unique())), true, budget)?;
+    let (lease, file) = create_locked(directory.root.join(format!("rg-index-work-v1-{}.sqlite", unique())), true, budget)?;
     drop(file);
     Ok(lease)
 }
@@ -377,8 +381,8 @@ pub struct PruneStats {
     pub pinned_bytes: u64,
 }
 pub fn maintain(root: &Path, budget: u64) -> io::Result<PruneStats> {
-    let _directory = directory_lock(root)?;
-    prune_locked(root, budget)
+    let directory = directory_lock(root)?;
+    prune_locked(&directory.root, budget)
 }
 fn prune_locked(root: &Path, budget: u64) -> io::Result<PruneStats> {
     let mut stats = PruneStats::default();

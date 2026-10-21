@@ -348,8 +348,8 @@ fn cache_unwritable_primary_reuses_and_cleans_the_fallback_directory() {
 }
 
 fn temporary_index(root: &Path) -> (Lease, File) {
-    let _directory = directory_lock(root).unwrap();
-    create_locked(root.join(format!("rg-index-work-v1-{}.sqlite", unique())), true, 4096).unwrap()
+    let directory = directory_lock(root).unwrap();
+    create_locked(directory.root.join(format!("rg-index-work-v1-{}.sqlite", unique())), true, 4096).unwrap()
 }
 fn checkout() -> io::Result<()> {
     for root in [index_dir(), index_fallback_dir()] {
@@ -447,7 +447,9 @@ fn cache_unix_symlink_roots_and_lock_files_are_rejected() {
     let other = Folder::new();
     let root = folder.0.join("linked");
     std::os::unix::fs::symlink(&other.0, &root).unwrap();
-    assert!(directory_lock(&root).is_err());
+    for alias in [root.clone(), root.join("."), PathBuf::from(format!("{}/", root.display()))] {
+        assert!(directory_lock(&alias).is_err(), "symlink root accepted: {}", alias.display());
+    }
     assert!(!other.0.join(".rustgis-cache-v1.lock").exists());
     let sentinel = other.0.join("sentinel");
     std::fs::write(&sentinel, b"unchanged").unwrap();
@@ -485,24 +487,30 @@ fn cache_unix_foreign_owned_roots_are_rejected() {
     }
 }
 
+/// A hidden, mutable intermediate link must not redirect a pinned SQLite pathname.
 #[cfg(unix)]
 #[test]
-fn cache_unix_owned_ancestor_symlinks_work_but_foreign_ones_do_not() {
+fn cache_unix_ancestor_symlink_retargeting_cannot_redirect_a_lease() {
     let folder = Folder::new();
-    let target = Folder::new();
-    let link = folder.0.join("via");
-    std::os::unix::fs::symlink(&target.0, &link).unwrap();
-    let cache = link.join("index");
-    drop(directory_lock(&cache).unwrap());
-    if rustix::process::geteuid().as_raw() == 0 {
-        rustix::fs::chownat(
-            rustix::fs::CWD,
-            &link,
-            Some(rustix::process::Uid::from_raw(65534)),
-            None,
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .unwrap();
-        assert_eq!(directory_lock(&cache).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
-    }
+    let original = Folder::new();
+    let replacement = Folder::new();
+    let bridge = folder.0.join("bridge");
+    let alias = folder.0.join("alias");
+    std::os::unix::fs::symlink(&original.0, &bridge).unwrap();
+    std::os::unix::fs::symlink(&bridge, &alias).unwrap();
+    let root = alias.join("index");
+    let reader = ready(&root, 1, 10, 4096);
+    let pinned = pin_index(&root, &key(1), 4096).unwrap().unwrap();
+    let replacement_root = replacement.0.join("index");
+    std::fs::create_dir(&replacement_root).unwrap();
+    let forged = replacement_root.join(reader.path().file_name().unwrap());
+    std::fs::write(forged, b"forged cache").unwrap();
+    std::fs::remove_file(&bridge).unwrap();
+    std::os::unix::fs::symlink(&replacement.0, &bridge).unwrap();
+    assert_eq!(std::fs::read(reader.path()).unwrap(), vec![0; 10]);
+    assert_eq!(std::fs::read(pinned.path()).unwrap(), vec![0; 10]);
+    assert_eq!(reader.path().parent().unwrap(), original.0.join("index").canonicalize().unwrap());
+    drop(pinned);
+    drop(reader);
+    maintain(&original.0.join("index"), 0).unwrap();
 }
