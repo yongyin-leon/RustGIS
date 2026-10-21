@@ -484,3 +484,25 @@ fn cache_unix_foreign_owned_roots_are_rejected() {
         assert!(!root.0.join(".rustgis-cache-v1.lock").exists());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn cache_unix_owned_ancestor_symlinks_work_but_foreign_ones_do_not() {
+    let folder = Folder::new();
+    let target = Folder::new();
+    let link = folder.0.join("via");
+    std::os::unix::fs::symlink(&target.0, &link).unwrap();
+    let cache = link.join("index");
+    drop(directory_lock(&cache).unwrap());
+    if rustix::process::geteuid().as_raw() == 0 {
+        rustix::fs::chownat(
+            rustix::fs::CWD,
+            &link,
+            Some(rustix::process::Uid::from_raw(65534)),
+            None,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        assert_eq!(directory_lock(&cache).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+}

@@ -99,6 +99,10 @@ fn validate_directory(root: &Path) -> io::Result<()> {
         // foreign-owned parent. Trusted sticky parents such as /tmp are supported.
         for path in [std::path::absolute(root)?, root.canonicalize()?] {
             for parent in path.ancestors().skip(1) {
+                let entry = std::fs::symlink_metadata(parent)?;
+                if entry.uid() != uid && entry.uid() != 0 {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cache ancestor is not owned by a trusted user"));
+                }
                 let metadata = std::fs::metadata(parent)?;
                 if !metadata.is_dir()
                     || (metadata.uid() != uid && metadata.uid() != 0)
