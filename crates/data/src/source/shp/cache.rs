@@ -20,7 +20,7 @@ pub fn index_dir() -> PathBuf {
     if let Some(root) = TEST_INDEX_DIR.with(|root| root.borrow().clone()) {
         return root;
     }
-    crate::source::external::cache_dir("RUSTGIS_SHP_CACHE", "shp-index").unwrap_or_else(|| std::env::temp_dir().join("rustgis-shp-index"))
+    crate::source::external::cache_dir("RUSTGIS_SHP_CACHE", "shp-index").unwrap_or_else(index_fallback_dir)
 }
 
 // Test-local routing avoids process-wide environment mutation and interference with
@@ -40,25 +40,93 @@ pub(crate) fn with_index_dir<T>(root: PathBuf, run: impl FnOnce() -> T) -> T {
     let _restore = Restore(TEST_INDEX_DIR.with(|current| current.replace(Some(root))));
     run()
 }
+/// Separate Unix users even when the system temporary directory is shared.
 pub fn index_fallback_dir() -> PathBuf {
-    std::env::temp_dir().join("rustgis-shp-index")
+    #[cfg(unix)]
+    let name = format!("rustgis-shp-index-{}", rustix::process::geteuid().as_raw());
+    #[cfg(not(unix))]
+    let name = "rustgis-shp-index";
+    std::env::temp_dir().join(name)
 }
-fn open_lock(path: &Path) -> io::Result<File> {
+
+/// Never follow a lease symlink or open a special file, including after a rename race.
+fn lease_file(path: &Path, create: bool) -> io::Result<File> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
         return Err(io::Error::other("cache lease is not a regular file"));
     }
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
+    options.read(true).write(true).create(create).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("cache lease is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cache lease is not private to this user"));
+        }
+    }
+    Ok(file)
+}
+fn open_lock(path: &Path) -> io::Result<File> {
+    lease_file(path, true)
+}
+
+/// Reject untrusted roots before touching their lock, including writable override parents.
+fn validate_directory(root: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    let metadata = std::fs::symlink_metadata(root)?;
+    #[cfg(not(unix))]
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cache root is not a real directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = rustix::process::geteuid().as_raw();
+        if metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cache root is not private to this user"));
+        }
+        // Check both spellings: an ancestor symlink must not hide a writable or
+        // foreign-owned parent. Trusted sticky parents such as /tmp are supported.
+        for path in [std::path::absolute(root)?, root.canonicalize()?] {
+            for parent in path.ancestors().skip(1) {
+                let metadata = std::fs::metadata(parent)?;
+                if !metadata.is_dir()
+                    || (metadata.uid() != uid && metadata.uid() != 0)
+                    || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
+                {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "cache parent is not trusted"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shared validation for blocking checkout and nonblocking release paths.
+fn directory_file(root: &Path) -> io::Result<File> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(root)?;
+    validate_directory(root)?;
+    open_lock(&root.join(".rustgis-cache-v1.lock"))
 }
 fn directory_lock(root: &Path) -> io::Result<File> {
-    std::fs::create_dir_all(root)?;
-    let file = open_lock(&root.join(".rustgis-cache-v1.lock"))?;
+    let file = directory_file(root)?;
     file.lock()?;
     Ok(file)
 }
@@ -88,7 +156,19 @@ fn unique() -> String {
     )
 }
 fn regular(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+    std::fs::symlink_metadata(path).is_ok_and(|m| {
+        if !m.file_type().is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if m.uid() != rustix::process::geteuid().as_raw() || m.mode() & 0o022 != 0 {
+                return false;
+            }
+        }
+        true
+    })
 }
 fn owned(name: &str) -> bool {
     if let Some(key) = name.strip_prefix("rg-index-v1-").and_then(|s| s.strip_suffix(".sqlite")) {
@@ -106,7 +186,7 @@ fn existing_lock(path: &Path) -> io::Result<File> {
     if !regular(path) {
         return Err(io::Error::other("missing regular cache lease"));
     }
-    OpenOptions::new().read(true).write(true).open(path)
+    lease_file(path, false)
 }
 
 /// Kept after the SQLite connection. The sidecar stays locked for the
@@ -159,7 +239,7 @@ impl Drop for Lease {
             let _ = file.set_modified(SystemTime::now());
         }
         self.lock.take();
-        let Ok(directory) = open_lock(&root.join(".rustgis-cache-v1.lock")) else { return };
+        let Ok(directory) = directory_file(root) else { return };
         if directory.try_lock().is_err() {
             retry_maintenance(root, self.budget);
             return;
