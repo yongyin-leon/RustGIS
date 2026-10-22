@@ -15,12 +15,15 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Cache regressions with a group-writable default umask
         shell: bash
         run: |
           umask 002
           cargo test --locked -p rustgis-data source::shp::cache::tests
       - name: Cache regressions with the usual CI umask
+        if: always()
         shell: bash
         run: |
           umask 022
